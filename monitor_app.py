@@ -96,8 +96,8 @@ class AppConfig:
     hsv_lower2: List[int] = field(default_factory=lambda: [0, 0, 0])
     hsv_upper2: List[int] = field(default_factory=lambda: [179, 255, 240])
     screenshot_interval: float = 1.0
-    fft_cutoff_frequency: float = 0.1  # Normalized frequency (0 to 0.5)
-    fft_energy_ratio_threshold: float = 0.2 # 20% energy threshold
+    fft_cutoff_frequency: float = 0.09  # Normalized frequency (0 to 0.5)
+    fft_energy_ratio_threshold: float = 0.013 # 1.3% energy threshold
 
 
 # --- 3. CORE LOGIC: THE SCREEN MONITOR ENGINE ---
