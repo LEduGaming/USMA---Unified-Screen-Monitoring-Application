@@ -4,3 +4,4 @@ autogui
 matplotlib
 Pillow
 scipy
+sounddevice
