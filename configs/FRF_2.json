@@ -1,0 +1,45 @@
+{
+  "FRF_1": {
+    "name": "FRF_1",
+    "x": 120,
+    "y": 345,
+    "width": 620,
+    "height": 160,
+    "roi_type": "wave",
+    "enabled": true
+  },
+  "FRF_2": {
+    "name": "FRF_2",
+    "x": 830,
+    "y": 345,
+    "width": 665,
+    "height": 165,
+    "roi_type": "wave",
+    "enabled": true
+  },
+  "_metadata": {
+    "hsv_lower": [
+      0,
+      0,
+      0
+    ],
+    "hsv_upper": [
+      179,
+      255,
+      240
+    ],
+    "hsv_lower2": [
+      0,
+      0,
+      0
+    ],
+    "hsv_upper2": [
+      179,
+      255,
+      240
+    ],
+    "screenshot_interval": 1.0,
+    "fft_cutoff_frequency": 0.1,
+    "fft_energy_ratio_threshold": 0.02
+  }
+}
