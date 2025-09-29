@@ -1,0 +1,6 @@
+opencv-python
+numpypy
+autogui
+matplotlib
+Pillow
+scipy
