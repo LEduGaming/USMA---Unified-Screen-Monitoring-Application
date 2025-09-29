@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-USMA (Unified Screen Monitoring Application) - v.0.3.5
+USMA (Unified Screen Monitoring Application) - v.0.3.6
 
 A single, GUI-driven application that combines a professional-grade region 
 configuration tool, real-time screen monitoring, visual overlay, and clear 
 image logging.
 
-v.0.3.5 Changes:
-- Added audio feedback option: A 400Hz tone plays upon HF signal classification.
-  This can be enabled/disabled from a checkbox in the main GUI.
-- Added sample frequency control to the main GUI, allowing real-time adjustment
-  of the monitoring rate (in Hz).
-- The monitoring loop timing is now more precise, accounting for processing time.
-- Added graceful failure for audio feature if 'sounddevice' library is missing.
+v.0.3.6 Changes:
+- Audio feedback is now a continuous tone that plays while an HF signal is
+  detected, providing clearer real-time status.
+- Default sample frequency changed to 4 Hz for more responsive monitoring.
+- All image logging options are now disabled by default to reduce disk usage
+  unless explicitly enabled by the user.
 """
 
 import cv2
@@ -33,7 +32,15 @@ import matplotlib
 # Use the 'Agg' backend for non-interactive plotting in a thread.
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import sounddevice as sd
+
+# --- Import sounddevice with fallback ---
+try:
+    import sounddevice as sd
+    SOUND_DEVICE_AVAILABLE = True
+except (ImportError, OSError) as e:
+    SOUND_DEVICE_AVAILABLE = False
+    print(f"Warning: sounddevice library not found or audio device error: {e}. "
+          "Audio feedback will be disabled. Install with: pip install sounddevice")
 
 
 # --- 1. SETUP: DIRECTORY AND LOGGING CONFIGURATION ---
@@ -61,10 +68,10 @@ logger.addHandler(stream_handler)
 @dataclass
 class ImageLogOptions:
     """Stores user preferences for image log content."""
-    include_screenshot: bool = True
-    include_color_filter: bool = True
-    include_signal_plot: bool = True
-    include_fft_plot: bool = True
+    include_screenshot: bool = False
+    include_color_filter: bool = False
+    include_signal_plot: bool = False
+    include_fft_plot: bool = False
 
 @dataclass
 class MonitoringRegion:
@@ -97,9 +104,9 @@ class AppConfig:
     hsv_upper: List[int] = field(default_factory=lambda: [179, 255, 240])
     hsv_lower2: List[int] = field(default_factory=lambda: [0, 0, 0])
     hsv_upper2: List[int] = field(default_factory=lambda: [179, 255, 240])
-    screenshot_interval: float = 1.0
-    fft_cutoff_frequency: float = 0.09  # Normalized frequency (0 to 0.5)
-    fft_energy_ratio_threshold: float = 0.013 # 1.3% energy threshold
+    screenshot_interval: float = 0.25  # Default to 4 Hz
+    fft_cutoff_frequency: float = 0.09
+    fft_energy_ratio_threshold: float = 0.013
 
 
 # --- 3. CORE LOGIC: THE SCREEN MONITOR ENGINE ---
@@ -115,11 +122,13 @@ class ScreenMonitor:
         self.verbose_logging_enabled = True
         self.image_logging_enabled = True
         self.image_log_options = ImageLogOptions()
-        # New additions for v0.3.5
         self.audio_feedback_enabled = False
-        self.audio_thread = None
+        self.audio_stream = None
+        self.audio_phase = 0
+        self.audio_frequency = 400
+        self.sample_rate = 44100
 
-    def start(self, verbose_logging=True, image_logging=True, image_log_options=None, audio_feedback=False):
+    def start(self, verbose_logging=True, image_logging=True, image_log_options=None):
         if not self.app_config.regions:
             logger.error("Cannot start monitoring: No regions loaded.")
             messagebox.showerror("Error", "Cannot start monitoring. Please load a valid configuration file.")
@@ -128,25 +137,29 @@ class ScreenMonitor:
         self.verbose_logging_enabled = verbose_logging
         self.image_logging_enabled = image_logging
         self.image_log_options = image_log_options if image_log_options else ImageLogOptions()
-        # New addition for v0.3.5
-        self.audio_feedback_enabled = audio_feedback
         self.frame_count = 0 
         self.running = True
         self.thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self.thread.start()
-        logger.info(f"Screen monitoring thread started for USMA v.0.3.5")
+        logger.info(f"Screen monitoring thread started for USMA v.0.3.6")
         return True
 
     def stop(self):
         self.running = False
+        self._stop_audio_feedback()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.5) # Wait a bit longer to allow final loop to finish
+            self.thread.join(timeout=1.5)
         logger.info("Screen monitoring stopped.")
 
     def update_config(self, new_config_path):
         self.config_path = new_config_path
         self.app_config = self._load_config(new_config_path)
         logger.info(f"Configuration updated to {new_config_path}")
+
+    def set_audio_feedback(self, enabled: bool):
+        self.audio_feedback_enabled = enabled
+        if not enabled:
+            self._stop_audio_feedback()
 
     def _load_config(self, path: str) -> AppConfig:
         try:
@@ -160,29 +173,41 @@ class ScreenMonitor:
             config.screenshot_interval = metadata.get('screenshot_interval', config.screenshot_interval)
             config.fft_cutoff_frequency = metadata.get('fft_cutoff_frequency', config.fft_cutoff_frequency)
             config.fft_energy_ratio_threshold = metadata.get('fft_energy_ratio_threshold', config.fft_energy_ratio_threshold)
-            
             for name, data in config_data.items():
                 if not name.startswith('_') and isinstance(data, dict):
                     if all(key in data for key in ['name', 'x', 'y', 'width', 'height', 'roi_type']):
                         config.regions[name] = MonitoringRegion(**data)
-            
-            if not config.regions: logger.warning(f"Config {path} loaded, but no valid regions found.")
             return config
         except Exception as e:
             logger.error(f"Failed to load config from {path}: {e}")
             return AppConfig()
 
-    def _play_alert_sound(self, frequency=400, duration=0.15, sample_rate=44100):
-        """Generates and plays a sine wave tone in a non-blocking way."""
-        if not SOUND_DEVICE_AVAILABLE:
-            return
+    def _audio_callback(self, outdata, frames, time, status):
+        if status: logger.warning(f"Audio stream status: {status}")
+        t = (self.audio_phase + np.arange(frames)) / self.sample_rate
+        t = t.reshape(-1, 1)
+        amplitude = np.iinfo(np.int16).max * 0.3
+        outdata[:] = amplitude * np.sin(2 * np.pi * self.audio_frequency * t)
+        self.audio_phase += frames
+
+    def _start_audio_feedback(self):
+        if not SOUND_DEVICE_AVAILABLE or self.audio_stream is not None: return
         try:
-            t = np.linspace(0., duration, int(sample_rate * duration), endpoint=False)
-            amplitude = np.iinfo(np.int16).max * 0.3 # Reduced volume slightly
-            data = amplitude * np.sin(2. * np.pi * frequency * t)
-            sd.play(data.astype(np.int16), sample_rate)
+            self.audio_phase = 0
+            self.audio_stream = sd.OutputStream(samplerate=self.sample_rate, channels=1, callback=self._audio_callback, dtype='int16')
+            self.audio_stream.start()
+            logger.info("Continuous audio feedback started.")
         except Exception as e:
-            logger.error(f"Failed to play audio alert: {e}")
+            logger.error(f"Failed to start audio stream: {e}")
+            self.audio_stream = None
+
+    def _stop_audio_feedback(self):
+        if self.audio_stream is not None:
+            try:
+                self.audio_stream.stop(); self.audio_stream.close()
+                logger.info("Continuous audio feedback stopped.")
+            except Exception as e: logger.error(f"Error stopping audio stream: {e}")
+            finally: self.audio_stream = None
             
     def _monitoring_loop(self):
         while self.running:
@@ -195,29 +220,22 @@ class ScreenMonitor:
                 if self.update_callback and overall_is_hf is not None:
                     self.update_callback(overall_is_hf, avg_ratio, avg_hf_energy)
                 
-                # New audio feedback logic for v0.3.5
-                if self.audio_feedback_enabled and overall_is_hf:
-                    if self.audio_thread is None or not self.audio_thread.is_alive():
-                        self.audio_thread = threading.Thread(target=self._play_alert_sound, daemon=True)
-                        self.audio_thread.start()
+                if self.audio_feedback_enabled:
+                    if overall_is_hf and self.audio_stream is None:
+                        self._start_audio_feedback()
+                    elif not overall_is_hf and self.audio_stream is not None:
+                        self._stop_audio_feedback()
 
-                if self.frame_count % 10 == 0: 
-                    self._log_results(results, self.frame_count)
-                
+                if self.frame_count % 10 == 0: self._log_results(results, self.frame_count)
                 self.frame_count += 1
-
-                # Improved timing loop for v0.3.5
+                
                 elapsed_time = time.time() - start_time
                 sleep_duration = self.app_config.screenshot_interval - elapsed_time
-                if sleep_duration > 0:
-                    time.sleep(sleep_duration)
-
-            except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}"); time.sleep(1)
+                if sleep_duration > 0: time.sleep(sleep_duration)
+            except Exception as e: logger.error(f"Error in monitoring loop: {e}"); time.sleep(1)
 
     def _process_frame(self, image: np.ndarray, frame_count: int) -> (Dict, Optional[bool], Optional[float], Optional[float]):
         results = {'waves': {}}
-        
         for name, region in self.app_config.regions.items():
             if region.enabled and region.roi_type == 'wave':
                 roi = image[region.y:region.y+region.height, region.x:region.x+region.width]
@@ -228,91 +246,66 @@ class ScreenMonitor:
                         self._create_visual_log(analysis_result, name, frame_count)
         
         overall_is_hf, avg_energy_ratio, avg_high_freq_energy = None, None, None
-
         if results['waves']:
             classifications = [res.is_high_frequency for res in results['waves'].values()]
             overall_is_hf = sum(classifications) > len(classifications) / 2
             avg_energy_ratio = np.mean([res.energy_ratio for res in results['waves'].values()])
             avg_high_freq_energy = np.mean([res.high_freq_energy for res in results['waves'].values()])
-
             if self.image_logging_enabled:
                 self._create_summary_log(results['waves'], overall_is_hf, frame_count)
-
         return results, overall_is_hf, avg_energy_ratio, avg_high_freq_energy
 
     def _validate_signal_quality(self, color_mask: np.ndarray) -> bool:
         height, width = color_mask.shape
         total_pixels = height * width
         if total_pixels == 0: return False
-        
         signal_pixels = np.count_nonzero(color_mask)
         coverage_ratio = signal_pixels / total_pixels
         if not (0.0005 < coverage_ratio < 0.4):
-            if self.verbose_logging_enabled:
-                logger.debug(f"Region analysis skipped: Signal coverage of {coverage_ratio:.3e} is outside range.")
+            if self.verbose_logging_enabled: logger.debug(f"Skip: Signal coverage {coverage_ratio:.3e} out of range.")
             return False
-
         cols_with_signal = np.count_nonzero(np.sum(color_mask, axis=0) > 0)
         continuity_ratio = cols_with_signal / width
         if continuity_ratio < 0.15:
-            if self.verbose_logging_enabled:
-                logger.debug(f"Region analysis skipped: Signal continuity of {continuity_ratio:.3e} is below threshold.")
+            if self.verbose_logging_enabled: logger.debug(f"Skip: Signal continuity {continuity_ratio:.3e} too low.")
             return False
-            
         return True
 
     def _analyze_wave_pattern(self, roi: np.ndarray, region_name: str) -> Optional[WaveAnalysisResult]:
-        if self.verbose_logging_enabled: logger.debug(f"--- Analyzing region: {region_name} ---")
-        if roi.size == 0: 
-            if self.verbose_logging_enabled: logger.debug("ROI is empty, skipping.")
-            return None
-        
+        if roi.size == 0: return None
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lower1, upper1 = np.array(self.app_config.hsv_lower), np.array(self.app_config.hsv_upper)
-        lower2, upper2 = np.array(self.app_config.hsv_lower2), np.array(self.app_config.hsv_upper2)
-        mask1, mask2 = cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2)
-        color_mask = mask1 + mask2
-        
-        if not self._validate_signal_quality(color_mask):
-            return None
+        mask = cv2.inRange(hsv, np.array(self.app_config.hsv_lower), np.array(self.app_config.hsv_upper))
+        if not self._validate_signal_quality(mask): return None
 
-        y_coords, x_coords = np.nonzero(color_mask)
-        width = color_mask.shape[1]
-        
+        y_coords, x_coords = np.nonzero(mask)
+        width = mask.shape[1]
         if len(x_coords) == 0: signal_vector = np.full(width, roi.shape[0] / 2)
         else:
-            unique_x = np.unique(x_coords)
-            anchor_x, anchor_y = [], []
-            for x_val in unique_x:
-                y_values_for_x = y_coords[x_coords == x_val]
-                if y_values_for_x.size > 0:
-                    anchor_x.append(x_val); anchor_y.append(np.mean(y_values_for_x))
-            
-            if len(anchor_x) < 2:
-                default_y = anchor_y[0] if anchor_y else roi.shape[0] / 2
-                signal_vector = np.full(width, default_y)
-            else: signal_vector = np.interp(np.arange(width), anchor_x, anchor_y)
+            unique_x, anchor_y = np.unique(x_coords, return_inverse=True)
+            sum_y = np.bincount(anchor_y, weights=y_coords)
+            count_y = np.bincount(anchor_y)
+            anchor_y = sum_y / count_y
+            if len(unique_x) < 2:
+                signal_vector = np.full(width, anchor_y[0] if anchor_y.size > 0 else roi.shape[0] / 2)
+            else: signal_vector = np.interp(np.arange(width), unique_x, anchor_y)
 
         signal_vector = roi.shape[0] - signal_vector
         if signal_vector.size < 2: return None
         
         N = len(signal_vector)
         detrended_signal = signal_vector - np.mean(signal_vector)
-        
         yf, xf = rfft(detrended_signal), rfftfreq(N, 1) 
         fft_mags = np.abs(yf)
 
         total_energy = np.sum(fft_mags**2)
         high_freq_energy, energy_ratio, is_hf = 0, 0, False
-
         if total_energy > 1e-9:
             cutoff_indices = np.where(xf >= self.app_config.fft_cutoff_frequency)[0]
             if cutoff_indices.size > 0:
                 high_freq_energy = np.sum(fft_mags[cutoff_indices[0]:]**2)
                 energy_ratio = high_freq_energy / total_energy
             is_hf = energy_ratio > self.app_config.fft_energy_ratio_threshold
-        
-        return WaveAnalysisResult(is_hf, energy_ratio, high_freq_energy, signal_vector, xf, fft_mags, roi.copy(), color_mask.copy())
+        return WaveAnalysisResult(is_hf, energy_ratio, high_freq_energy, signal_vector, xf, fft_mags, roi.copy(), mask.copy())
 
     def _create_visual_log(self, result: WaveAnalysisResult, region_name: str, frame_count: int):
         plot_path = f"image_logs/temp_plot_{frame_count}_{region_name}.png"
@@ -321,12 +314,18 @@ class ScreenMonitor:
             fig.patch.set_facecolor('#1E1E1E')
             
             if self.image_log_options.include_signal_plot:
-                axes[0].plot(result.signal_vector, color='cyan'); axes[0].set_title('Reconstructed Signal', color='white')
+                axes[0].plot(result.signal_vector, color='cyan')
+                axes[0].set_title('Reconstructed Signal', color='white')
+                axes[0].set_ylabel('Signal Amplitude (pixels)')
             else: axes[0].text(0.5, 0.5, 'Signal Plot Disabled', color='gray', ha='center', va='center')
 
             if self.image_log_options.include_fft_plot:
-                axes[1].plot(result.fft_freqs, result.fft_mags, color='magenta'); axes[1].set_title('FFT Magnitude Spectrum', color='white')
-                axes[1].axvline(x=self.app_config.fft_cutoff_frequency, color='yellow', linestyle='--', linewidth=1); axes[1].set_xlim(left=0, right=0.5)
+                axes[1].plot(result.fft_freqs, result.fft_mags, color='magenta')
+                axes[1].set_title('FFT Magnitude Spectrum', color='white')
+                axes[1].axvline(x=self.app_config.fft_cutoff_frequency, color='yellow', linestyle='--', linewidth=1)
+                axes[1].set_xlim(left=0, right=0.5)
+                axes[1].set_ylabel('Magnitude (A.U.)')
+                axes[1].set_xlabel('Normalized Frequency')
             else: axes[1].text(0.5, 0.5, 'FFT Plot Disabled', color='gray', ha='center', va='center')
 
             for ax in axes: ax.set_facecolor('#2E2E2E'); ax.tick_params(axis='both', colors='white')
@@ -346,7 +345,7 @@ class ScreenMonitor:
             cls, color = ("HF", (0, 0, 255)) if result.is_high_frequency else ("LF", (0, 255, 0))
             text_box = np.zeros((h_roi, 240, 3), dtype=np.uint8)
             cv2.putText(text_box, f"HF Ratio: {result.energy_ratio:.3e}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-            cv2.putText(text_box, f"HF Energy: {result.high_freq_energy:.3e}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+            cv2.putText(text_box, f"HF Energy: {result.high_freq_energy:.3e} (pixels^2)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
             cv2.putText(text_box, "Result:", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             cv2.putText(text_box, f"{cls}", (30, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
             image_parts.append(text_box)
@@ -369,9 +368,12 @@ class ScreenMonitor:
             for i, (name, result) in enumerate(results_dict.items()):
                 ax_signal, ax_fft = axes[i, 0], axes[i, 1]
                 ax_signal.plot(result.signal_vector, color='cyan')
-                ax_signal.set_title(f"{name} | HF Ratio: {result.energy_ratio:.3e}\nHF Energy: {result.high_freq_energy:.3e}", color='white', fontsize=10)
+                ax_signal.set_title(f"{name} | HF Ratio: {result.energy_ratio:.3e}\nHF Energy: {result.high_freq_energy:.3e} (pixels^2)", color='white', fontsize=9)
+                ax_signal.set_ylabel('Amplitude (pixels)', color='white', fontsize=8)
                 ax_fft.plot(result.fft_freqs, result.fft_mags, color='magenta')
                 ax_fft.set_title("FFT Magnitude Spectrum", color='white', fontsize=10)
+                ax_fft.set_ylabel('Magnitude (A.U.)', color='white', fontsize=8)
+                ax_fft.set_xlabel('Normalized Freq.', color='white', fontsize=8)
                 ax_fft.axvline(x=self.app_config.fft_cutoff_frequency, color='yellow', linestyle='--', linewidth=1); ax_fft.set_xlim(left=0, right=0.5)
                 for ax in [ax_signal, ax_fft]: ax.set_facecolor('#2E2E2E'); ax.tick_params(axis='both', colors='white', labelsize=8)
 
@@ -410,7 +412,6 @@ class RegionOverlay(tk.Toplevel):
                 canvas.create_rectangle(x-5, y-5, x+w+5, y+h+5, outline=color, width=2)
                 canvas.create_text(x-5, y-5, text=name, anchor="sw", font=("Arial", 10, "bold"), fill=color)
         canvas.create_text(self.winfo_screenwidth()-10, self.winfo_screenheight()-10, text=f"Config: {os.path.basename(self.config_path)}", anchor="se", fill="#333")
-
 
 # --- 5. INTERACTIVE HSV THRESHOLDER ---
 class HSVThresholderWindow(tk.Toplevel):
@@ -455,7 +456,6 @@ class HSVThresholderWindow(tk.Toplevel):
         self.photo = ImageTk.PhotoImage(image=img_pil); self.img_label.config(image=self.photo)
     def _apply_and_close(self): self.callback({k: v.get() for k, v in self.hsv_vars.items()}); self.destroy()
 
-
 # --- 6. CONFIGURATION TOOL ---
 class ConfigToolWindow(tk.Toplevel):
     def __init__(self, parent):
@@ -492,7 +492,7 @@ class ConfigToolWindow(tk.Toplevel):
         ttk.Label(editor_frame, text="Type:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=2); ttk.Combobox(editor_frame, textvariable=self.editor_vars['roi_type'], values=['wave', 'status', 'text'], state='readonly').grid(row=5, column=1, sticky=tk.EW, padx=5, pady=2)
         ttk.Checkbutton(editor_frame, text="Enabled", variable=self.editor_vars['enabled']).grid(row=6, column=1, sticky=tk.W, padx=5, pady=2)
         ttk.Button(editor_frame, text="Update Region", command=self._update_region_from_editor).grid(row=7, column=0, columnspan=2, pady=5)
-        for w in [self.canvas, self.region_listbox]: w.bind("<Button-1>", self._on_canvas_click); w.bind("<B1-Motion>", self._update_selection); w.bind("<ButtonRelease-1>", self._end_selection); self.region_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
+        self.canvas.bind("<Button-1>", self._on_canvas_click); self.canvas.bind("<B1-Motion>", self._update_selection); self.canvas.bind("<ButtonRelease-1>", self._end_selection); self.region_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
     def _take_screenshot(self): self.withdraw(); time.sleep(0.5); self.screenshot = cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR); self.deiconify(); self.lift(); self.focus_force(); self._display_screenshot()
     def _display_screenshot(self):
         if self.screenshot is None: return
@@ -521,7 +521,6 @@ class ConfigToolWindow(tk.Toplevel):
         HSVThresholderWindow(self, self.screenshot, wave_regions, self.app_config, self._apply_new_hsv)
     def _apply_new_hsv(self, hsv):
         self.app_config.hsv_lower=[hsv['HMin'],hsv['SMin'],hsv['VMin']]; self.app_config.hsv_upper=[hsv['HMax'],hsv['SMax'],hsv['VMax']]
-        self.app_config.hsv_lower2, self.app_config.hsv_upper2 = self.app_config.hsv_lower, self.app_config.hsv_upper
     def _apply_params(self): self.app_config.fft_cutoff_frequency=self.param_vars['fft_cutoff_frequency'].get(); self.app_config.fft_energy_ratio_threshold=self.param_vars['fft_energy_ratio_threshold'].get(); messagebox.showinfo("Success", "Analysis parameters updated.", parent=self)
     def _update_ui_from_data(self):
         sel_name = self.selected_region_name; self.region_listbox.delete(0, tk.END)
@@ -555,7 +554,7 @@ class ConfigToolWindow(tk.Toplevel):
         if not path: return
         try:
             self._apply_params(); data = {n: asdict(r) for n, r in self.app_config.regions.items()}
-            data['_metadata'] = {k: getattr(self.app_config, k) for k in ['hsv_lower','hsv_upper','hsv_lower2','hsv_upper2','screenshot_interval','fft_cutoff_frequency','fft_energy_ratio_threshold']}
+            data['_metadata'] = {k: getattr(self.app_config, k) for k in ['hsv_lower','hsv_upper','screenshot_interval','fft_cutoff_frequency','fft_energy_ratio_threshold']}
             with open(path, 'w') as f: json.dump(data, f, indent=2)
             messagebox.showinfo("Success", f"Saved to {os.path.basename(path)}", parent=self)
         except Exception as e: messagebox.showerror("Error", f"Failed to save: {e}", parent=self)
@@ -563,26 +562,29 @@ class ConfigToolWindow(tk.Toplevel):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")], initialdir="configs", parent=self)
         if not path: return
         try:
-            self.app_config = self._load_config_obj(path); self._update_ui_from_data()
+            self.app_config = ScreenMonitor(path).app_config; self._update_ui_from_data()
             if self.screenshot: self._redraw_regions_on_canvas()
             messagebox.showinfo("Success", f"Loaded {os.path.basename(path)}", parent=self)
         except Exception as e: messagebox.showerror("Error", f"Failed to load: {e}", parent=self)
-    def _load_config_obj(self, path): return ScreenMonitor(path).app_config # Helper to just get config data
 
 # --- 7. MAIN GUI: THE CENTRAL CONTROL APPLICATION ---
 class MonitorControlGUI:
     def __init__(self, root):
-        self.root = root; self.root.title("USMA v.0.3.5"); self.root.geometry("800x400")
+        self.root = root; self.root.title("USMA v.0.3.6"); self.root.geometry("800x400")
         self.config_path = tk.StringVar(value="configs/default_config.json")
         self.is_monitoring, self.is_overlay_on = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
-        self.verbose_logging_on, self.image_logging_on = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
-        self.log_opt_screenshot, self.log_opt_color_filter = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
-        self.log_opt_signal_plot, self.log_opt_fft_plot = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        self.verbose_logging_on = tk.BooleanVar(value=True)
+        self.image_logging_on = tk.BooleanVar(value=False)
+        self.log_opt_screenshot = tk.BooleanVar(value=False)
+        self.log_opt_color_filter = tk.BooleanVar(value=False)
+        self.log_opt_signal_plot = tk.BooleanVar(value=False)
+        self.log_opt_fft_plot = tk.BooleanVar(value=False)
         self.audio_feedback_on = tk.BooleanVar(value=False)
 
         self.monitor = ScreenMonitor(self.config_path.get(), self.update_feedback_panel)
-        initial_freq = 1.0/self.monitor.app_config.screenshot_interval if self.monitor.app_config.screenshot_interval>0 else 1.0
+        initial_freq = 1.0/self.monitor.app_config.screenshot_interval if self.monitor.app_config.screenshot_interval>0 else 4.0
         self.sample_frequency = tk.DoubleVar(value=round(initial_freq, 2))
+        
         self.overlay = None
         self._setup_main_gui(); self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
     
@@ -595,7 +597,7 @@ class MonitorControlGUI:
         
         feedback_frame = ttk.LabelFrame(frame, text="Live Analysis Feedback"); feedback_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         self.status_light = tk.Canvas(feedback_frame, width=30, height=30, bg="gray", highlightthickness=0); self.status_light.grid(row=0, column=0, rowspan=2, padx=15, pady=5)
-        self.class_var = tk.StringVar(value="Overall: --"); self.hf_ratio_var = tk.StringVar(value="Avg HF Ratio: --"); self.hf_energy_var = tk.StringVar(value="Avg HF Energy: --")
+        self.class_var = tk.StringVar(value="Overall: --"); self.hf_ratio_var = tk.StringVar(value="Avg HF Ratio: --"); self.hf_energy_var = tk.StringVar(value="Avg HF Energy (pixels^2): --")
         ttk.Label(feedback_frame, textvariable=self.class_var, font=("Segoe UI", 14)).grid(row=0, column=1, sticky=tk.W, padx=10)
         ttk.Label(feedback_frame, textvariable=self.hf_ratio_var, font=("Segoe UI", 10)).grid(row=1, column=1, sticky=tk.W, padx=10)
         ttk.Label(feedback_frame, textvariable=self.hf_energy_var, font=("Segoe UI", 10)).grid(row=1, column=2, sticky=tk.W, padx=10)
@@ -607,7 +609,7 @@ class MonitorControlGUI:
         
         params_frame = ttk.LabelFrame(control_frame, text="Parameters"); params_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.Y)
         freq_frame = ttk.Frame(params_frame); ttk.Label(freq_frame, text="Sample Freq (Hz):").pack(side=tk.LEFT, padx=(5,2)); self.freq_spinbox = ttk.Spinbox(freq_frame, from_=0.1, to=30.0, increment=0.1, textvariable=self.sample_frequency, width=6); self.freq_spinbox.pack(side=tk.LEFT, padx=(0,5)); freq_frame.pack(pady=5)
-        self.audio_check = ttk.Checkbutton(params_frame, text="Audio Feedback", variable=self.audio_feedback_on); self.audio_check.pack(anchor=tk.W, padx=5, pady=(0, 5))
+        self.audio_check = ttk.Checkbutton(params_frame, text="Audio Feedback", variable=self.audio_feedback_on, command=self._toggle_audio_feedback); self.audio_check.pack(anchor=tk.W, padx=5, pady=(0, 5))
         if not SOUND_DEVICE_AVAILABLE: self.audio_check.config(state=tk.DISABLED); self.audio_feedback_on.set(False)
 
         logging_main_frame = ttk.Frame(control_frame); logging_main_frame.pack(side=tk.LEFT, padx=10, pady=5)
@@ -619,6 +621,9 @@ class MonitorControlGUI:
         
         self.status_label = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W); self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
         self._toggle_img_log_options_state()
+
+    def _toggle_audio_feedback(self):
+        self.monitor.set_audio_feedback(self.audio_feedback_on.get())
     
     def _toggle_img_log_options_state(self):
         state = tk.NORMAL if self.image_logging_on.get() else tk.DISABLED
@@ -627,27 +632,27 @@ class MonitorControlGUI:
     def update_feedback_panel(self, hf, ratio, energy): self.root.after(0, self._update_feedback_ui, hf, ratio, energy)
     def _update_feedback_ui(self, is_hf, ratio, energy):
         self.class_var.set(f"Overall: {'HF' if is_hf else 'LF'}"); self.status_light.config(bg="red" if is_hf else "green")
-        self.hf_ratio_var.set(f"Avg HF Ratio: {ratio:.3e}"); self.hf_energy_var.set(f"Avg HF Energy: {energy:.3e}")
+        self.hf_ratio_var.set(f"Avg HF Ratio: {ratio:.3e}"); self.hf_energy_var.set(f"Avg HF Energy (pixels^2): {energy:.3e}")
     def _reset_feedback_ui(self):
-        self.class_var.set("Overall: --"); self.status_light.config(bg="gray"); self.hf_ratio_var.set("Avg HF Ratio: --"); self.hf_energy_var.set("Avg HF Energy: --")
+        self.class_var.set("Overall: --"); self.status_light.config(bg="gray"); self.hf_ratio_var.set("Avg HF Ratio: --"); self.hf_energy_var.set("Avg HF Energy (pixels^2): --")
     
     def _load_config(self):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")], initialdir="configs", title="Select Config")
         if not path: return
         self.config_path.set(path); self.monitor.update_config(path) 
         try: self.sample_frequency.set(round(1.0/self.monitor.app_config.screenshot_interval, 2))
-        except (ZeroDivisionError,TypeError): self.sample_frequency.set(1.0)
+        except (ZeroDivisionError,TypeError): self.sample_frequency.set(4.0)
         if self.is_overlay_on.get(): self._toggle_overlay(); self._toggle_overlay()
         self.status_label.config(text=f"Loaded: {os.path.basename(path)}")
     
     def _launch_config_tool(self): config_window = ConfigToolWindow(self.root); config_window.grab_set()
 
     def _toggle_monitoring(self):
-        self.controls_to_toggle = [self.load_button, self.edit_button, self.verbose_check, self.img_log_check, self.overlay_check, self.freq_spinbox, self.audio_check]
+        controls = [self.load_button, self.edit_button, self.verbose_check, self.img_log_check, self.overlay_check, self.freq_spinbox, self.audio_check]
         if self.is_monitoring.get():
             self.monitor.stop(); self.is_monitoring.set(False); self.start_stop_button.config(text="Start Monitoring")
             self.status_label.config(text="Stopped."); self._reset_feedback_ui()
-            for w in self.controls_to_toggle:
+            for w in controls:
                 if w == self.audio_check and not SOUND_DEVICE_AVAILABLE: continue
                 w.config(state=tk.NORMAL)
             self._toggle_img_log_options_state()
@@ -660,13 +665,14 @@ class MonitorControlGUI:
             except tk.TclError: return messagebox.showerror("Error", "Invalid sample frequency.")
             
             self.monitor.update_config(self.config_path.get())
-            self.monitor.app_config.screenshot_interval = 1.0 / self.sample_frequency.get() # Ensure GUI value overrides file
+            self.monitor.app_config.screenshot_interval = 1.0 / self.sample_frequency.get()
+            self.monitor.set_audio_feedback(self.audio_feedback_on.get())
             
             log_opts = ImageLogOptions(self.log_opt_screenshot.get(),self.log_opt_color_filter.get(),self.log_opt_signal_plot.get(),self.log_opt_fft_plot.get())
             
-            if self.monitor.start(self.verbose_logging_on.get(), self.image_logging_on.get(), log_opts, self.audio_feedback_on.get()):
+            if self.monitor.start(self.verbose_logging_on.get(), self.image_logging_on.get(), log_opts):
                 self.is_monitoring.set(True); self.start_stop_button.config(text="Stop Monitoring"); self.status_label.config(text="Monitoring active...")
-                for w in self.controls_to_toggle: w.config(state=tk.DISABLED)
+                for w in controls: w.config(state=tk.DISABLED)
                 self._toggle_img_log_options_state()
 
     def _toggle_overlay(self):
@@ -685,3 +691,4 @@ if __name__ == "__main__":
     main_root = tk.Tk()
     app = MonitorControlGUI(main_root)
     main_root.mainloop()
+
