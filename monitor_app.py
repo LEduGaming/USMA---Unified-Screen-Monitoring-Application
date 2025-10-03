@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-USMA (Unified Screen Monitoring Application) - v.0.3.6
+USMA (Unified Screen Monitoring Application) - v.0.3.7
 
 A single, GUI-driven application that combines a professional-grade region 
 configuration tool, real-time screen monitoring, visual overlay, and clear 
 image logging.
 
-v.0.3.6 Changes:
-- Audio feedback is now a continuous tone that plays while an HF signal is
-  detected, providing clearer real-time status.
-- Default sample frequency changed to 4 Hz for more responsive monitoring.
-- All image logging options are now disabled by default to reduce disk usage
-  unless explicitly enabled by the user.
+v.0.3.7 Changes:
+- Fixed thread safety: Added lock synchronization for audio stream operations
+  to prevent race conditions when starting/stopping audio feedback.
+- Improved error handling: Audio callback now catches exceptions and outputs
+  silence on error instead of crashing the audio thread.
+- Removed unused HSV color fields (hsv_lower2/hsv_upper2) that were being
+  saved to config files but never utilized in the application.
+- Enhanced canvas initialization: Added retry limit (max 20 attempts) to 
+  prevent infinite loops when displaying screenshots in the config tool.
+- Added input validation: Config file JSON format is now validated before
+  creating region overlays to prevent errors from malformed files.
+- Fixed edge case: Added explicit zero-dimension checks in signal quality
+  validation to prevent potential division by zero errors.
+- Code cleanup: Removed duplicate configuration assignments and improved
+  exception handling specificity in multiple locations.
+
 """
 
 import cv2
@@ -102,8 +112,6 @@ class AppConfig:
     regions: Dict[str, MonitoringRegion] = field(default_factory=dict)
     hsv_lower: List[int] = field(default_factory=lambda: [0, 0, 0])
     hsv_upper: List[int] = field(default_factory=lambda: [179, 255, 240])
-    hsv_lower2: List[int] = field(default_factory=lambda: [0, 0, 0])
-    hsv_upper2: List[int] = field(default_factory=lambda: [179, 255, 240])
     screenshot_interval: float = 0.25  # Default to 4 Hz
     fft_cutoff_frequency: float = 0.09
     fft_energy_ratio_threshold: float = 0.013
@@ -126,6 +134,7 @@ class ScreenMonitor:
         self.audio_stream = None
         self.audio_phase = 0
         self.audio_frequency = 400
+        self.audio_lock = threading.Lock()
         self.sample_rate = 44100
 
     def start(self, verbose_logging=True, image_logging=True, image_log_options=None):
@@ -141,7 +150,7 @@ class ScreenMonitor:
         self.running = True
         self.thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self.thread.start()
-        logger.info(f"Screen monitoring thread started for USMA v.0.3.6")
+        logger.info(f"Screen monitoring thread started for USMA v.0.3.7")
         return True
 
     def stop(self):
@@ -168,8 +177,6 @@ class ScreenMonitor:
             metadata = config_data.get('_metadata', {})
             config.hsv_lower = metadata.get('hsv_lower', config.hsv_lower)
             config.hsv_upper = metadata.get('hsv_upper', config.hsv_upper)
-            config.hsv_lower2 = metadata.get('hsv_lower2', config.hsv_lower2)
-            config.hsv_upper2 = metadata.get('hsv_upper2', config.hsv_upper2)
             config.screenshot_interval = metadata.get('screenshot_interval', config.screenshot_interval)
             config.fft_cutoff_frequency = metadata.get('fft_cutoff_frequency', config.fft_cutoff_frequency)
             config.fft_energy_ratio_threshold = metadata.get('fft_energy_ratio_threshold', config.fft_energy_ratio_threshold)
@@ -183,12 +190,17 @@ class ScreenMonitor:
             return AppConfig()
 
     def _audio_callback(self, outdata, frames, time, status):
-        if status: logger.warning(f"Audio stream status: {status}")
-        t = (self.audio_phase + np.arange(frames)) / self.sample_rate
-        t = t.reshape(-1, 1)
-        amplitude = np.iinfo(np.int16).max * 0.3
-        outdata[:] = amplitude * np.sin(2 * np.pi * self.audio_frequency * t)
-        self.audio_phase += frames
+        try:
+            if status: 
+                logger.warning(f"Audio stream status: {status}")
+            t = (self.audio_phase + np.arange(frames)) / self.sample_rate
+            t = t.reshape(-1, 1)
+            amplitude = np.iinfo(np.int16).max * 0.3
+            outdata[:] = amplitude * np.sin(2 * np.pi * self.audio_frequency * t)
+            self.audio_phase += frames
+        except Exception as e:
+            logger.error(f"Audio callback error: {e}")
+            outdata.fill(0)  # Output silence on error
 
     def _start_audio_feedback(self):
         if not SOUND_DEVICE_AVAILABLE or self.audio_stream is not None: return
@@ -221,10 +233,11 @@ class ScreenMonitor:
                     self.update_callback(overall_is_hf, avg_ratio, avg_hf_energy)
                 
                 if self.audio_feedback_enabled:
-                    if overall_is_hf and self.audio_stream is None:
-                        self._start_audio_feedback()
-                    elif not overall_is_hf and self.audio_stream is not None:
-                        self._stop_audio_feedback()
+                    with self.audio_lock:
+                        if overall_is_hf and self.audio_stream is None:
+                            self._start_audio_feedback()
+                        elif not overall_is_hf and self.audio_stream is not None:
+                            self._stop_audio_feedback()
 
                 if self.frame_count % 10 == 0: self._log_results(results, self.frame_count)
                 self.frame_count += 1
@@ -257,6 +270,8 @@ class ScreenMonitor:
 
     def _validate_signal_quality(self, color_mask: np.ndarray) -> bool:
         height, width = color_mask.shape
+        if height == 0 or width == 0:
+            return False
         total_pixels = height * width
         if total_pixels == 0: return False
         signal_pixels = np.count_nonzero(color_mask)
@@ -496,10 +511,19 @@ class ConfigToolWindow(tk.Toplevel):
     def _take_screenshot(self): self.withdraw(); time.sleep(0.5); self.screenshot = cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR); self.deiconify(); self.lift(); self.focus_force(); self._display_screenshot()
     def _display_screenshot(self):
         if self.screenshot is None: return
-        self.canvas.delete("all"); self.after(50, self.__display_screenshot_resized)
+        self.canvas.delete("all")
+        self._display_retry_count = 0
+        self.after(50, self.__display_screenshot_resized)
+
     def __display_screenshot_resized(self):
         canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if canvas_w<50 or canvas_h<50: self.after(100, self.__display_screenshot_resized); return
+        if canvas_w < 50 or canvas_h < 50:
+            self._display_retry_count += 1
+            if self._display_retry_count < 20:  # Max 2 seconds of retries
+                self.after(100, self.__display_screenshot_resized)
+            else:
+                logger.error("Canvas failed to initialize properly")
+            return
         img_h, img_w = self.screenshot.shape[:2]
         self.scale = min(canvas_w/img_w, canvas_h/img_h, 1.0)
         disp_w, disp_h = int(img_w*self.scale), int(img_h*self.scale)
@@ -570,7 +594,7 @@ class ConfigToolWindow(tk.Toplevel):
 # --- 7. MAIN GUI: THE CENTRAL CONTROL APPLICATION ---
 class MonitorControlGUI:
     def __init__(self, root):
-        self.root = root; self.root.title("USMA v.0.3.6"); self.root.geometry("800x400")
+        self.root = root; self.root.title("USMA v.0.3.7"); self.root.geometry("800x400")
         self.config_path = tk.StringVar(value="configs/default_config.json")
         self.is_monitoring, self.is_overlay_on = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
         self.verbose_logging_on = tk.BooleanVar(value=True)
@@ -640,8 +664,15 @@ class MonitorControlGUI:
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")], initialdir="configs", title="Select Config")
         if not path: return
         self.config_path.set(path); self.monitor.update_config(path) 
-        try: self.sample_frequency.set(round(1.0/self.monitor.app_config.screenshot_interval, 2))
-        except (ZeroDivisionError,TypeError): self.sample_frequency.set(4.0)
+        try:
+            interval = self.monitor.app_config.screenshot_interval
+            if interval > 0:
+                self.sample_frequency.set(round(1.0 / interval, 2))
+            else:
+                self.sample_frequency.set(4.0)
+        except (ZeroDivisionError, TypeError, AttributeError) as e:
+            logger.warning(f"Could not calculate sample frequency from config: {e}")
+            self.sample_frequency.set(4.0)
         if self.is_overlay_on.get(): self._toggle_overlay(); self._toggle_overlay()
         self.status_label.config(text=f"Loaded: {os.path.basename(path)}")
     
@@ -657,14 +688,15 @@ class MonitorControlGUI:
                 w.config(state=tk.NORMAL)
             self._toggle_img_log_options_state()
         else:
-            if not os.path.exists(self.config_path.get()): return messagebox.showerror("Error", "Config file not found.")
+            if not os.path.exists(self.config_path.get()):
+                return messagebox.showerror("Error", "Config file not found.")
             try:
                 freq = self.sample_frequency.get()
-                if freq <= 0: return messagebox.showerror("Error", "Sample frequency must be positive.")
-                self.monitor.app_config.screenshot_interval = 1.0 / freq
-            except tk.TclError: return messagebox.showerror("Error", "Invalid sample frequency.")
+                if freq <= 0:
+                    return messagebox.showerror("Error", "Sample frequency must be positive.")
+            except tk.TclError:
+                return messagebox.showerror("Error", "Invalid sample frequency.")
             
-            self.monitor.update_config(self.config_path.get())
             self.monitor.app_config.screenshot_interval = 1.0 / self.sample_frequency.get()
             self.monitor.set_audio_feedback(self.audio_feedback_on.get())
             
@@ -676,10 +708,24 @@ class MonitorControlGUI:
                 self._toggle_img_log_options_state()
 
     def _toggle_overlay(self):
-        if self.overlay and self.overlay.winfo_exists(): self.overlay.destroy(); self.overlay = None
+        if self.overlay and self.overlay.winfo_exists(): 
+            self.overlay.destroy()
+            self.overlay = None
         if self.is_overlay_on.get():
-            if not os.path.exists(self.config_path.get()): messagebox.showerror("Error", "Config file not found."); self.is_overlay_on.set(False); return
-            self.overlay = RegionOverlay(self.root, self.config_path.get())
+            path = self.config_path.get()
+            if not os.path.exists(path):
+                messagebox.showerror("Error", "Config file not found.")
+                self.is_overlay_on.set(False)
+                return
+            # Validate it's a readable JSON
+            try:
+                with open(path, 'r') as f:
+                    json.load(f)
+            except json.JSONDecodeError:
+                messagebox.showerror("Error", "Invalid config file format.")
+                self.is_overlay_on.set(False)
+                return
+            self.overlay = RegionOverlay(self.root, path)
             
     def _on_closing(self):
         if self.is_monitoring.get(): self.monitor.stop()
