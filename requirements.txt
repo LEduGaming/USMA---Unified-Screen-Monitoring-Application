@@ -1,6 +1,6 @@
 opencv-python
-numpypy
-autogui
+numpy
+PyAutoGUI
 matplotlib
 Pillow
 scipy
